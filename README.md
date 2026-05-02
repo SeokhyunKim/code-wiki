@@ -21,7 +21,7 @@ The wiki being committed means the synthesis cost is paid once and shared across
 This plugin is part of the `seokhyunkim` Claude Code marketplace.
 
 ```
-/plugin marketplace add github:SeokhyunKim/claude-plugins
+/plugin marketplace add SeokhyunKim/claude-plugins
 /plugin install code-wiki@seokhyunkim
 ```
 
