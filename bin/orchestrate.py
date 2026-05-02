@@ -42,29 +42,38 @@ Output shape
       "wiki_language": "ko",
       "language_hints": [...],
       "concurrency": 10,
-      "totals": {"items": 154, "waves": 5, "leaves": 126, "parents": 28},
+      "totals": {"items": 154, "waves": 5, "batches": 16, "leaves": 126, "parents": 28},
       "waves": [
         {
           "wave": 1,
           "size": 126,
-          "items": [
+          "batches": [
             {
-              "skill": "code-wiki:generate-leaf-page",
-              "wiki_path": "wiki/.../index.md",
-              "args_json": "{\\"folder_abs\\": ..., ...}"
+              "batch": 1,
+              "size": 10,
+              "items": [
+                {
+                  "skill": "code-wiki:generate-leaf-page",
+                  "wiki_path": "wiki/.../index.md",
+                  "args_json": "{\\"folder_abs\\": ..., ...}"
+                },
+                ... 10 total ...
+              ]
             },
-            ...
+            ... 13 batches in wave 1 (12 of size 10 + 1 of size 6) ...
           ]
         },
-        {"wave": 2, "size": 17, "items": [...]},
+        {"wave": 2, "size": 17, "batches": [...]},
         ...
       ]
     }
 
-The LLM iterates `waves` in order. Within each wave, it dispatches `size`
-agents in batches of at most `concurrency`, waiting for each batch to complete
-before starting the next. Waves themselves must be processed strictly in order
-(a parent's children must exist on disk before the parent is generated).
+The LLM iterates `waves` in order, and within each wave iterates `batches` in
+order. For each batch, it dispatches all `items` in parallel and waits for
+every agent to finish before starting the next batch. Waves themselves must
+be processed strictly in order (a parent's children must exist on disk before
+the parent is generated). Batches inside a wave have no inter-dependency and
+exist solely to cap concurrency at `concurrency`.
 """
 
 from __future__ import annotations
@@ -263,6 +272,7 @@ def main() -> int:
             "totals": {
                 "items": 0,
                 "waves": 0,
+                "batches": 0,
                 "leaves": leaves_total,
                 "parents": parents_total,
                 "skipped_existing": skipped,
@@ -276,14 +286,25 @@ def main() -> int:
     # Group into waves (topological).
     waves_raw = compute_waves(items, project_root=project_root)
 
-    # Pre-render each item.
+    # Pre-render each item, then split each wave into concurrency-capped batches.
     plan_waves = []
-    for i, wave_items in enumerate(waves_raw, start=1):
+    total_batches = 0
+    for wi, wave_items in enumerate(waves_raw, start=1):
         rendered = [
             render_item(x, project_root=project_root, lang=lang, hints=hints)
             for x in wave_items
         ]
-        plan_waves.append({"wave": i, "size": len(rendered), "items": rendered})
+        cap = max(1, args.concurrency)
+        batches = []
+        for bi, start in enumerate(range(0, len(rendered), cap), start=1):
+            chunk = rendered[start:start + cap]
+            batches.append({"batch": bi, "size": len(chunk), "items": chunk})
+        total_batches += len(batches)
+        plan_waves.append({
+            "wave": wi,
+            "size": len(rendered),
+            "batches": batches,
+        })
 
     plan = {
         "operation": args.operation,
@@ -294,6 +315,7 @@ def main() -> int:
         "totals": {
             "items": sum(w["size"] for w in plan_waves),
             "waves": len(plan_waves),
+            "batches": total_batches,
             "leaves": leaves_total,
             "parents": parents_total,
             "skipped_existing": skipped,

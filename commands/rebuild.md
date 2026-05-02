@@ -58,18 +58,19 @@ overwrite existing pages.
 If `orchestrate.py` exits non-zero (cycle, malformed work list, missing config),
 surface its stderr verbatim and abort.
 
-## Step 4: Execute the plan — per-page agents in concurrency batches per wave
+## Step 4: Execute the plan — per-page agents, one batch at a time
 
 Same shape as `/code-wiki:build` Step 3:
 
 - **One agent per Skill call.** Never hand-loop `Skill` from this command —
   the agent that loops is empirically flaky after the first Skill return.
 - **Iterate `waves` in order.** Wave N waits for wave N-1 to finish.
-- **Within a wave, batch by `concurrency`.** Up to `plan.concurrency` parallel
-  agents per batch; wait for `<task-notification>` from each before starting
-  the next batch.
+- **Within a wave, iterate `batches` in order.** Each batch's items dispatch
+  in parallel; the next batch starts only after every agent in the current
+  batch has reported back (`<task-notification>` per agent). Batches are
+  pre-split by `concurrency`; you don't need to compute the split.
 
-For each item in each batch, dispatch a background `Agent` whose prompt is:
+For each wave → each batch → each item, dispatch a background `Agent` whose prompt is:
 
 ```
 Generate exactly one wiki page. Invoke the `<item.skill>` skill ONCE with these

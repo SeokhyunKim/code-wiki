@@ -49,32 +49,43 @@ The plan has shape:
   "wiki_language": "...",
   "language_hints": [...],
   "concurrency": 10,
-  "totals": {"items": N, "waves": W, "leaves": L, "parents": P, "skipped_existing": 0},
+  "totals": {"items": N, "waves": W, "batches": B, "leaves": L, "parents": P, "skipped_existing": 0},
   "waves": [
     {
       "wave": 1,
       "size": <int>,
-      "items": [
+      "batches": [
         {
-          "skill": "code-wiki:generate-leaf-page",
-          "wiki_path": "wiki/.../index.md",
-          "args_json": "{...}"
+          "batch": 1,
+          "size": <int, ≤ concurrency>,
+          "items": [
+            {
+              "skill": "code-wiki:generate-leaf-page",
+              "wiki_path": "wiki/.../index.md",
+              "args_json": "{...}"
+            },
+            ...
+          ]
         },
-        ...
+        ... more batches in this wave ...
       ]
     },
-    {"wave": 2, "size": ..., "items": [...]},
+    {"wave": 2, "size": ..., "batches": [...]},
     ...
   ]
 }
 ```
+
+`batches` are pre-split by `concurrency`: a wave of 126 items with
+`concurrency=10` becomes 13 batches (12 of size 10 + 1 of size 6). You don't
+need to compute batch boundaries — just iterate them.
 
 If `totals.items` is `0`, abort:
 > "No source folders to wikify. Check `source_roots` and `ignore_patterns` in wiki/config.yaml."
 
 If `orchestrate.py` exits non-zero (cycle, malformed work list, missing config), surface its stderr verbatim and abort.
 
-## Step 3: Execute the plan — per-page agents in concurrency batches per wave
+## Step 3: Execute the plan — per-page agents, one batch at a time
 
 This step is **non-negotiable about its dispatch shape**, because the alternative
 (one agent looping over many items invoking `Skill` repeatedly) is empirically
@@ -86,14 +97,16 @@ treat it as task completion. To stay reliable:
   output, report a one-line JSON result, exit."
 - **Iterate `waves` in order.** Wave N may not start until wave N-1 has
   finished — a parent's children must exist on disk before the parent runs.
-- **Within a wave, batch by `concurrency`.** Dispatch up to `plan.concurrency`
-  agents in parallel, wait for that batch to finish (via `<task-notification>`
-  events), then dispatch the next batch within the same wave.
+- **Within a wave, iterate `batches` in order.** All `items` in a batch are
+  dispatched in parallel; the next batch starts only after every agent in the
+  current batch has reported back (`<task-notification>` per agent). Batches
+  inside a wave have no inter-dependency; they exist purely as a concurrency
+  cap so you never fire more than `plan.concurrency` agents at once.
 - **Do NOT hand-loop with `Skill` from this command.** Always go through `Agent`
   dispatch. This guarantees one Skill call per agent context.
 
-For each wave, for each batch of up to `concurrency` items, dispatch each item
-as one background `Agent` whose prompt is exactly:
+For each wave → each batch → each item, dispatch one background `Agent` whose
+prompt is exactly:
 
 ```
 Generate exactly one wiki page. Invoke the `<item.skill>` skill ONCE
@@ -124,8 +137,10 @@ verify on disk that each `wiki_path` exists with non-empty content. Treat any
 agent's `ok: false` *or* missing-on-disk as a generation failure for that item
 — log it, but continue the build (it's best-effort).
 
-Move to the next batch within the wave; when the wave is exhausted, advance to
-the next wave; repeat until all waves are done.
+When the current batch is fully verified, advance to the next batch in the
+same wave. When the wave's batches are exhausted, advance to the next wave.
+Repeat until all waves are done. Total agents you will dispatch =
+`plan.totals.items`; total batches = `plan.totals.batches`.
 
 ### Resume after partial failure
 

@@ -121,6 +121,15 @@ def test_missing_config_errors(tmp_path: Path) -> None:
 # ---- basic plan structure --------------------------------------------------
 
 
+def _wave_items(plan: dict, wave_idx: int) -> list[dict]:
+    """Flatten all items across batches of a given wave (1-indexed in the plan)."""
+    wave = plan["waves"][wave_idx]
+    out = []
+    for batch in wave["batches"]:
+        out.extend(batch["items"])
+    return out
+
+
 def test_single_leaf_one_wave(tmp_path: Path) -> None:
     _setup_project(tmp_path)
     rc, plan, err = _run(tmp_path, [_leaf("src/auth")])
@@ -129,12 +138,16 @@ def test_single_leaf_one_wave(tmp_path: Path) -> None:
     assert plan["wiki_language"] == "ko"
     assert plan["language_hints"] == ["python"]
     assert plan["totals"] == {
-        "items": 1, "waves": 1, "leaves": 1, "parents": 0, "skipped_existing": 0,
+        "items": 1, "waves": 1, "batches": 1,
+        "leaves": 1, "parents": 0, "skipped_existing": 0,
     }
     assert len(plan["waves"]) == 1
     wave = plan["waves"][0]
     assert wave["wave"] == 1 and wave["size"] == 1
-    item = wave["items"][0]
+    assert len(wave["batches"]) == 1
+    batch = wave["batches"][0]
+    assert batch["batch"] == 1 and batch["size"] == 1 and len(batch["items"]) == 1
+    item = batch["items"][0]
     assert item["skill"] == "code-wiki:generate-leaf-page"
     assert item["wiki_path"] == "wiki/src/auth/index.md"
     args = json.loads(item["args_json"])
@@ -161,7 +174,9 @@ def test_parent_with_children_uses_parent_skill(tmp_path: Path) -> None:
     assert len(plan["waves"]) == 2
     assert plan["waves"][0]["size"] == 2
     assert plan["waves"][1]["size"] == 1
-    parent_item = plan["waves"][1]["items"][0]
+    parent_items = _wave_items(plan, 1)
+    assert len(parent_items) == 1
+    parent_item = parent_items[0]
     assert parent_item["skill"] == "code-wiki:generate-parent-page"
     args = json.loads(parent_item["args_json"])
     assert args["child_wiki_paths"] == [
@@ -183,7 +198,8 @@ def test_wave_ordering_three_levels(tmp_path: Path) -> None:
     assert rc == 0, err
     assert plan["totals"]["waves"] == 3
     paths_per_wave = [
-        [it["wiki_path"] for it in w["items"]] for w in plan["waves"]
+        [it["wiki_path"] for it in _wave_items(plan, i)]
+        for i in range(3)
     ]
     assert paths_per_wave[0] == ["wiki/src/api/v1/auth/index.md"]
     assert paths_per_wave[1] == ["wiki/src/api/v1/index.md"]
@@ -203,7 +219,7 @@ def test_wave_with_independent_siblings_grouped_together(tmp_path: Path) -> None
     assert plan["totals"]["waves"] == 2
     assert plan["waves"][0]["size"] == 3
     # Stable order matches original work-list order.
-    assert [it["wiki_path"] for it in plan["waves"][0]["items"]] == [
+    assert [it["wiki_path"] for it in _wave_items(plan, 0)] == [
         "wiki/src/a/index.md", "wiki/src/b/index.md", "wiki/src/c/index.md",
     ]
     assert plan["waves"][1]["size"] == 1
@@ -222,7 +238,7 @@ def test_existing_on_disk_satisfies_dependency(tmp_path: Path) -> None:
     # Only the parent in the work list; its child wiki is already on disk so
     # the parent is immediately ready.
     assert plan["totals"]["waves"] == 1
-    assert plan["waves"][0]["items"][0]["wiki_path"] == "wiki/src/api/index.md"
+    assert _wave_items(plan, 0)[0]["wiki_path"] == "wiki/src/api/index.md"
 
 
 def test_unresolved_dependency_exits_2(tmp_path: Path) -> None:
@@ -248,7 +264,7 @@ def test_skip_existing_drops_done_items(tmp_path: Path) -> None:
     assert rc == 0, err
     assert plan["totals"]["items"] == 1
     assert plan["totals"]["skipped_existing"] == 1
-    assert plan["waves"][0]["items"][0]["wiki_path"] == "wiki/src/b/index.md"
+    assert _wave_items(plan, 0)[0]["wiki_path"] == "wiki/src/b/index.md"
 
 
 def test_skip_existing_all_done_yields_empty_plan(tmp_path: Path) -> None:
@@ -274,7 +290,7 @@ def test_loose_files_basenames_only(tmp_path: Path) -> None:
     ])
     rc, plan, err = _run(tmp_path, [item])
     assert rc == 0, err
-    args = json.loads(plan["waves"][0]["items"][0]["args_json"])
+    args = json.loads(_wave_items(plan, 0)[0]["args_json"])
     assert args["loose_files"] == ["string.py", "io.py", "__init__.py"]
 
 
@@ -298,7 +314,7 @@ def test_unicode_paths_round_trip(tmp_path: Path) -> None:
     item = _leaf("src/한글")
     rc, plan, err = _run(tmp_path, [item])
     assert rc == 0, err
-    args_json = plan["waves"][0]["items"][0]["args_json"]
+    args_json = _wave_items(plan, 0)[0]["args_json"]
     # ensure_ascii=False path: literal unicode is preserved in args_json
     assert "한글" in args_json
     args = json.loads(args_json)
@@ -314,3 +330,68 @@ def test_unknown_kind_errors(tmp_path: Path) -> None:
     rc, plan, err = _run(tmp_path, [bad])
     # The error surfaces during render; exit code is non-zero (Python traceback).
     assert rc != 0
+
+
+# ---- batch splitting -------------------------------------------------------
+
+
+def test_wave_split_into_batches_at_concurrency_cap(tmp_path: Path) -> None:
+    """A wave of 26 items with concurrency=10 should produce 3 batches:
+    sizes 10, 10, 6, in original order."""
+    _setup_project(tmp_path)
+    items = [_leaf(f"src/m{i:02d}") for i in range(26)]
+    rc, plan, err = _run(tmp_path, items, "--concurrency", "10")
+    assert rc == 0, err
+    assert plan["totals"]["items"] == 26
+    assert plan["totals"]["waves"] == 1
+    assert plan["totals"]["batches"] == 3
+    wave = plan["waves"][0]
+    assert wave["size"] == 26
+    assert [b["size"] for b in wave["batches"]] == [10, 10, 6]
+    assert [b["batch"] for b in wave["batches"]] == [1, 2, 3]
+    # Original work-list order preserved across batch boundaries
+    flat = _wave_items(plan, 0)
+    assert [it["wiki_path"] for it in flat] == [
+        f"wiki/src/m{i:02d}/index.md" for i in range(26)
+    ]
+
+
+def test_batch_size_equals_concurrency_when_evenly_divisible(tmp_path: Path) -> None:
+    _setup_project(tmp_path)
+    items = [_leaf(f"src/m{i}") for i in range(20)]
+    rc, plan, err = _run(tmp_path, items, "--concurrency", "5")
+    assert rc == 0, err
+    assert plan["totals"]["batches"] == 4
+    assert all(b["size"] == 5 for b in plan["waves"][0]["batches"])
+
+
+def test_concurrency_one_yields_one_item_per_batch(tmp_path: Path) -> None:
+    _setup_project(tmp_path)
+    items = [_leaf(f"src/m{i}") for i in range(4)]
+    rc, plan, err = _run(tmp_path, items, "--concurrency", "1")
+    assert rc == 0, err
+    assert plan["totals"]["batches"] == 4
+    assert all(b["size"] == 1 for b in plan["waves"][0]["batches"])
+
+
+def test_concurrency_larger_than_wave_yields_single_batch(tmp_path: Path) -> None:
+    _setup_project(tmp_path)
+    items = [_leaf(f"src/m{i}") for i in range(3)]
+    rc, plan, err = _run(tmp_path, items, "--concurrency", "100")
+    assert rc == 0, err
+    assert plan["totals"]["batches"] == 1
+    assert plan["waves"][0]["batches"][0]["size"] == 3
+
+
+def test_total_batches_aggregates_across_waves(tmp_path: Path) -> None:
+    _setup_project(tmp_path)
+    # 7 leaves → wave 1; 1 parent → wave 2. concurrency=3 → wave 1 has 3 batches (3,3,1), wave 2 has 1.
+    items = [_leaf(f"src/a{i}") for i in range(7)] + [
+        _parent("src", [f"src/a{i}" for i in range(7)])
+    ]
+    rc, plan, err = _run(tmp_path, items, "--concurrency", "3")
+    assert rc == 0, err
+    assert plan["totals"]["waves"] == 2
+    assert plan["totals"]["batches"] == 3 + 1
+    assert [b["size"] for b in plan["waves"][0]["batches"]] == [3, 3, 1]
+    assert [b["size"] for b in plan["waves"][1]["batches"]] == [1]

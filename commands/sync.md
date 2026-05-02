@@ -73,7 +73,7 @@ python3 -c "import json,sys; json.dump(json.load(sys.stdin)['pages'], sys.stdout
 
 If `pages` was empty (only deletions / dirty_topics), skip Step 5 entirely.
 
-## Step 5: Execute the plan — per-page agents in concurrency batches per wave
+## Step 5: Execute the plan — per-page agents, one batch at a time
 
 Same shape as `/code-wiki:build` Step 3. Briefly:
 
@@ -82,11 +82,12 @@ Same shape as `/code-wiki:build` Step 3. Briefly:
   dispatch sidesteps that failure mode.
 - **Iterate `waves` in order** — wave N waits for wave N-1 (parent depends on
   child wikis being on disk).
-- **Within a wave, batch by `concurrency`** — fire up to `plan.concurrency`
-  agents in parallel, wait for the batch (`<task-notification>` per agent),
-  then dispatch the next batch.
+- **Within a wave, iterate `batches` in order** — each batch's items are
+  dispatched in parallel; wait for every agent in the batch (`<task-notification>`
+  per agent) before starting the next batch. Batches are pre-split by
+  `concurrency`; you never need to compute the split yourself.
 
-For each item in each batch, dispatch a background `Agent` with the prompt:
+For each wave → each batch → each item, dispatch a background `Agent` with the prompt:
 
 ```
 Generate exactly one wiki page. Invoke the `<item.skill>` skill ONCE with these
