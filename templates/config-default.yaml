@@ -34,13 +34,39 @@ language_hints: []
 # Files and folders to skip during ingestion. gitignore-style globs evaluated
 # relative to each source root. Add patterns specific to your project.
 ignore_patterns:
-  - "**/node_modules/**"
-  - "**/__pycache__/**"
+  # VCS
   - "**/.git/**"
+  # JS / TS
+  - "**/node_modules/**"
   - "**/dist/**"
   - "**/build/**"
+  - "**/.next/**"
+  - "**/.nuxt/**"
+  - "**/.svelte-kit/**"
   - "**/*.min.js"
   - "**/*.lock"
+  # Python
+  - "**/__pycache__/**"
+  - "**/.venv/**"
+  - "**/venv/**"
+  - "**/env/**"
+  - "**/.pytest_cache/**"
+  - "**/.mypy_cache/**"
+  - "**/.ruff_cache/**"
+  - "**/.tox/**"
+  - "**/*.egg-info/**"
+  - "**/htmlcov/**"
+  # Other languages
+  - "**/target/**"          # Rust, Java/Maven
+  - "**/vendor/**"           # Go, PHP
+  # Tooling / editors
+  - "**/.terraform/**"
+  - "**/.idea/**"
+  - "**/.vscode/**"
+  - "**/.VSCodeCounter/**"
+  - "**/coverage/**"
+  - "**/.coverage"
+  - "**/test-results/**"
 
 # Heuristics for spawning per-file wiki pages within a leaf folder.
 # A per-file page is created when a file is large enough or its containing folder
