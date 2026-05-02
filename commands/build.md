@@ -1,7 +1,7 @@
 ---
 description: Generate the entire wiki from scratch (bottom-up) — runs once at the start of a project, or after a structural reset. For incremental updates, use `/code-wiki:sync`.
 argument-hint: [--force]
-allowed-tools: Bash(python3 *), Bash(git *), Read, Write, Skill
+allowed-tools: Bash(python3 *), Bash(git *), Bash(mkdir *), Read, Write, Skill, Agent
 ---
 
 The user wants to build the wiki from scratch. The arguments may include `--force`.
@@ -23,82 +23,163 @@ Run these checks in order. Stop on the first failure with a clear message.
      > "wiki/<source-root>/ already has content. Re-run with `--force` to overwrite, or use `/code-wiki:sync` for incremental updates."
    - With `--force`, proceed (existing files will be overwritten file-by-file as we regenerate).
 
-## Step 2: Build the work list
+## Step 2: Build the dispatch plan
+
+Pipe the bottom-up work list from `walk-tree.py` straight into `orchestrate.py`,
+which groups items into topological waves and pre-renders Skill args for each
+item:
 
 ```bash
-python3 "${CLAUDE_PLUGIN_ROOT}/bin/walk-tree.py" --project-root "$(pwd)"
+python3 "${CLAUDE_PLUGIN_ROOT}/bin/walk-tree.py" --project-root "$(pwd)" \
+  > /tmp/code-wiki-worklist.json
+
+python3 "${CLAUDE_PLUGIN_ROOT}/bin/orchestrate.py" \
+    --project-root "$(pwd)" \
+    --operation build \
+    --concurrency 10 \
+    --worklist /tmp/code-wiki-worklist.json \
+  > /tmp/code-wiki-plan.json
 ```
 
-Capture the JSON output. It's an array of work items, each with:
-- `source_root`, `folder_relpath`, `kind` (`leaf` or `parent`), `source_files`, `child_wikis`, `wiki_path`.
+The plan has shape:
 
-The order is **bottom-up**: every leaf comes before its parents. This is the order you must iterate — generating a parent before its children would read stale child wikis.
+```json
+{
+  "operation": "build",
+  "wiki_language": "...",
+  "language_hints": [...],
+  "concurrency": 10,
+  "totals": {"items": N, "waves": W, "batches": B, "leaves": L, "parents": P, "skipped_existing": 0},
+  "waves": [
+    {
+      "wave": 1,
+      "size": <int>,
+      "batches": [
+        {
+          "batch": 1,
+          "size": <int, ≤ concurrency>,
+          "items": [
+            {
+              "skill": "code-wiki:generate-leaf-page",
+              "wiki_path": "wiki/.../index.md",
+              "args_json": "{...}"
+            },
+            ...
+          ]
+        },
+        ... more batches in this wave ...
+      ]
+    },
+    {"wave": 2, "size": ..., "batches": [...]},
+    ...
+  ]
+}
+```
 
-If the array is empty, abort:
+`batches` are pre-split by `concurrency`: a wave of 126 items with
+`concurrency=10` becomes 13 batches (12 of size 10 + 1 of size 6). You don't
+need to compute batch boundaries — just iterate them.
+
+If `totals.items` is `0`, abort:
 > "No source folders to wikify. Check `source_roots` and `ignore_patterns` in wiki/config.yaml."
 
-## Step 3: Read configuration
+If `orchestrate.py` exits non-zero (cycle, malformed work list, missing config), surface its stderr verbatim and abort.
 
-Read `wiki/config.yaml` to get `wiki_language` and `language_hints`. You'll pass these to each skill invocation. If `wiki_language` is missing, default to `en`.
+## Step 3: Execute the plan — per-page agents, one batch at a time
 
-## Step 4: Generate pages — iterate the work list in order
+This step is **non-negotiable about its dispatch shape**, because the alternative
+(one agent looping over many items invoking `Skill` repeatedly) is empirically
+flaky: a non-trivial fraction of agents stop after the first `Skill` return and
+treat it as task completion. To stay reliable:
 
-For each work item in the JSON, in order:
+- **One agent per Skill call.** Each work item is dispatched as a single
+  background agent whose entire job is "invoke this one Skill, verify the
+  output, report a one-line JSON result, exit."
+- **Iterate `waves` in order.** Wave N may not start until wave N-1 has
+  finished — a parent's children must exist on disk before the parent runs.
+- **Within a wave, iterate `batches` in order.** All `items` in a batch are
+  dispatched in parallel; the next batch starts only after every agent in the
+  current batch has reported back (`<task-notification>` per agent). Batches
+  inside a wave have no inter-dependency; they exist purely as a concurrency
+  cap so you never fire more than `plan.concurrency` agents at once.
+- **Do NOT hand-loop with `Skill` from this command.** Always go through `Agent`
+  dispatch. This guarantees one Skill call per agent context.
 
-1. Ensure the wiki page's parent directory exists (`mkdir -p` of `dirname wiki_path`).
-2. Invoke the appropriate skill:
+For each wave → each batch → each item, dispatch one background `Agent` whose
+prompt is exactly:
 
-   - If `kind == "leaf"`:
-     ```
-     Skill(skill="code-wiki:generate-leaf-page", args="""
-       {
-         "folder_abs": "<absolute path to folder = $(pwd)/folder_relpath>",
-         "folder_relpath": "<work_item.folder_relpath>",
-         "source_root":     "<work_item.source_root>",
-         "loose_files":     [<basenames from work_item.source_files>],
-         "target_wiki_relpath": "<work_item.wiki_path>",
-         "wiki_language":   "<from config>",
-         "language_hints":  [<from config>]
-       }
-     """)
-     ```
-   - If `kind == "parent"`:
-     ```
-     Skill(skill="code-wiki:generate-parent-page", args="""
-       {
-         "folder_abs": "<absolute path>",
-         "folder_relpath": "<...>",
-         "source_root":     "<...>",
-         "loose_files":     [<basenames>],
-         "child_wiki_paths": <work_item.child_wikis>,
-         "target_wiki_relpath": "<work_item.wiki_path>",
-         "wiki_language":   "<from config>",
-         "language_hints":  [<from config>]
-       }
-     """)
-     ```
+```
+Generate exactly one wiki page. Invoke the `<item.skill>` skill ONCE
+with these args, then verify the output and report.
 
-3. After the skill returns, verify the wiki file was created at `wiki_path`. If not, treat as a generation error — log it and continue to the next item (build is best-effort across folders; partial output is acceptable).
+```
+Skill(skill="<item.skill>", args="<item.args_json>")
+```
 
-**Important**: do not parallelize parent generation. A parent's children must be on disk before the parent is generated. The work list ordering already enforces this; just don't reorder.
+After the skill returns, verify `<project_root>/<item.wiki_path>` exists
+with non-empty content.
 
-## Step 5: Update state.json and log.md
+Output as your final message:
 
-Once all skills have run, build a JSON report:
+```json
+{"wiki_path": "<item.wiki_path>", "ok": true|false, "reason": "..."}
+```
+
+Do not commit. Do not modify `wiki/CLAUDE.md` or `wiki/config.yaml`.
+```
+
+Note that `<item.args_json>` from the plan is already a valid JSON string;
+you only need to escape its inner `"` characters as `\"` when interpolating
+into the Skill call inside the prompt.
+
+When all agents in a batch have returned (one `<task-notification>` per agent),
+verify on disk that each `wiki_path` exists with non-empty content. Treat any
+agent's `ok: false` *or* missing-on-disk as a generation failure for that item
+— log it, but continue the build (it's best-effort).
+
+When the current batch is fully verified, advance to the next batch in the
+same wave. When the wave's batches are exhausted, advance to the next wave.
+Repeat until all waves are done. Total agents you will dispatch =
+`plan.totals.items`; total batches = `plan.totals.batches`.
+
+### Resume after partial failure
+
+If the build is interrupted and you re-run `/code-wiki:build --force`, add
+`--skip-existing` to the orchestrate.py call so already-built pages are dropped
+from the plan:
+
+```bash
+python3 "${CLAUDE_PLUGIN_ROOT}/bin/orchestrate.py" \
+    --project-root "$(pwd)" \
+    --operation build \
+    --concurrency 10 \
+    --skip-existing \
+    --worklist /tmp/code-wiki-worklist.json \
+  > /tmp/code-wiki-plan.json
+```
+
+The plan will include only the missing pages, still in their correct waves.
+
+## Step 4: Update state.json and log.md
+
+Once the plan is fully executed, build the state-update report from the work
+list captured in Step 2 (state-update needs the raw work-item shape, not the
+dispatch plan):
 
 ```json
 {
   "operation": "build",
   "ingested_sha": "<HEAD SHA from Step 1>",
-  "pages": <the original work-list array, possibly filtered to drop any items where the wiki file was not actually written>,
+  "pages": <contents of /tmp/code-wiki-worklist.json, possibly filtered to drop items whose wiki file was not actually written>,
   "deletions": []
 }
 ```
 
-Pass it to:
+Pass it to state-update:
 
 ```bash
-echo '<report json>' | python3 "${CLAUDE_PLUGIN_ROOT}/bin/state-update.py" --project-root "$(pwd)"
+echo '<report json>' \
+  | python3 "${CLAUDE_PLUGIN_ROOT}/bin/state-update.py" --project-root "$(pwd)"
 ```
 
 The script:
@@ -108,15 +189,17 @@ The script:
 - Sets `last_ingested_sha`.
 - Appends a build entry to `.code-wiki/log.md`.
 
-If `state-update.py` exits non-zero, surface its stderr to the user — state has not been written and the wiki may be inconsistent.
+If `state-update.py` exits non-zero, surface its stderr to the user — state
+has not been written and the wiki may be inconsistent.
 
-## Step 6: Report
+## Step 5: Report
 
 Print a concise summary:
 
 ```
 Built wiki at <project_root>/wiki/
 - pages generated: <N>
+- waves:           <W> (max parallel within a wave = <max wave size>, concurrency cap = <plan.concurrency>)
 - source roots:    <list>
 - last_ingested_sha: <sha>
 Run /code-wiki:lint to check the result, or /code-wiki:query <q> to use it.
@@ -124,8 +207,10 @@ Run /code-wiki:lint to check the result, or /code-wiki:query <q> to use it.
 
 ## Failure modes
 
-- A skill invocation produces an empty or malformed page → note in summary, do not fail the whole build. The user can re-run targeted with `/code-wiki:rebuild <path>` later.
+- A skill invocation produces an empty or malformed page → note in summary, do not fail the whole build. The user can re-run with `/code-wiki:rebuild <path>` later.
+- An agent never reports back → check disk; if the wiki file exists with non-empty content, count it as success; otherwise as failure.
 - `walk-tree.py` errors → surface stderr verbatim and abort.
+- `orchestrate.py` exits 2 (unresolved deps — typically a cycle or external child wiki missing) → surface stderr and abort.
 - `state-update.py` errors → surface stderr verbatim. State may be stale; suggest re-running build.
 
 ## What this command does NOT do
