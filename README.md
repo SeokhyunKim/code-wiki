@@ -2,7 +2,7 @@
 
 A Claude Code plugin that builds and maintains a hierarchical, LLM-generated wiki over a codebase. Point it at one or more source-root directories and it generates a markdown wiki mirroring the tree structure: leaf folders summarize their files, parent folders synthesize their children, and topic pages capture cross-cutting concerns. Following [Karpathy's llm-wiki pattern](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f) adapted to source code.
 
-> **Status**: pre-release (v0.2.0). The 7 commands work end-to-end on small fixtures; broader real-world testing pending. v0.2 introduces a wave-grouped, per-page agent dispatch pattern for `build`/`sync`/`rebuild` (see `bin/orchestrate.py`) that handles real-world repos in the 100s-of-pages range reliably.
+> **Status**: pre-release (v0.1.1). The 7 commands work end-to-end on small fixtures; broader real-world testing pending. v0.1.1 hardens `build`/`sync`/`rebuild` for large repos with a wave-grouped, per-page agent dispatch pattern (see `bin/orchestrate.py`).
 
 ## Concept
 
